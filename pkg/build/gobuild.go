@@ -402,6 +402,7 @@ func build(ctx context.Context, ip string, dir string, platform v1.Platform, con
 	cmd.Stdout = &output
 
 	log.Printf("Building %s for %s", ip, platformToString(platform))
+	log.Printf("CMD: %s\n", cmd) // go build -o /tmp/ko[id]/out import_path
 	if err := cmd.Run(); err != nil {
 		os.RemoveAll(tmpDir)
 		log.Printf("Unexpected error running \"go build\": %v\n%v", err, output.String())
@@ -429,6 +430,7 @@ func appFilename(importpath string) string {
 const userOwnerAndGroupSID = "AQAAgBQAAAAkAAAAAAAAAAAAAAABAgAAAAAABSAAAAAhAgAAAQIAAAAAAAUgAAAAIQIAAA=="
 
 func tarBinary(name, binary string, creationTime v1.Time, platform *v1.Platform) (*bytes.Buffer, error) {
+	log.Printf("TB binary: %s\n", binary)
 	buf := bytes.NewBuffer(nil)
 	tw := tar.NewWriter(buf)
 	defer tw.Close()
@@ -702,8 +704,10 @@ func (g *gobuild) configForImportPath(ip string) Config {
 	return config
 }
 
-func (g *gobuild) buildOne(ctx context.Context, refStr string, base v1.Image, platform *v1.Platform) (v1.Image, error) {
+func (g *gobuild) buildOne2(ctx context.Context, refStr string, base v1.Image, platform *v1.Platform) (v1.Image, error) {
 	ref := newRef(refStr)
+
+	log.Printf("REF: %s\n", refStr)
 
 	cf, err := base.ConfigFile()
 	if err != nil {
@@ -774,6 +778,136 @@ func (g *gobuild) buildOne(ctx context.Context, refStr string, base v1.Image, pl
 	})
 
 	// Augment the base image with our application layer.
+	withApp, err := mutate.Append(base, layers...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Start from a copy of the base image's config file, and set
+	// the entrypoint to our app.
+	cfg, err := withApp.ConfigFile()
+	if err != nil {
+		return nil, err
+	}
+
+	cfg = cfg.DeepCopy()
+	cfg.Config.Entrypoint = []string{appPath}
+	if platform.OS == "windows" {
+		cfg.Config.Entrypoint = []string{`C:\ko-app\` + appFilename(ref.Path())}
+		updatePath(cfg, `C:\ko-app`)
+		cfg.Config.Env = append(cfg.Config.Env, `KO_DATA_PATH=C:\var\run\ko`)
+	} else {
+		updatePath(cfg, appPath)
+		cfg.Config.Env = append(cfg.Config.Env, "KO_DATA_PATH="+kodataRoot)
+	}
+	cfg.Author = "github.com/google/ko"
+
+	if cfg.Config.Labels == nil {
+		cfg.Config.Labels = map[string]string{}
+	}
+	for k, v := range g.labels {
+		cfg.Config.Labels[k] = v
+	}
+
+	image, err := mutate.ConfigFile(withApp, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	empty := v1.Time{}
+	if g.creationTime != empty {
+		return mutate.CreatedAt(image, g.creationTime)
+	}
+	return image, nil
+}
+
+// This builds a single image with multiple binaries.
+func (g *gobuild) buildOne(ctx context.Context, refStr string, base v1.Image, platform *v1.Platform) (v1.Image, error) {
+	ref := newRef(refStr)
+
+	cf, err := base.ConfigFile()
+	if err != nil {
+		return nil, err
+	}
+	if platform == nil {
+		platform = &v1.Platform{
+			OS:           cf.OS,
+			Architecture: cf.Architecture,
+			OSVersion:    cf.OSVersion,
+		}
+	}
+
+	// from intended path to tmpfile
+	files := map[string]string{}
+
+	pkgs := []string{"./cmd/honeyalb", "./cmd/honeyelb"}
+
+	// my _kingdom_ for a _map_ function
+	for _, pkg := range pkgs {
+		log.Printf("PKG: %s\n", pkg)
+		// Do the build into a temporary file.
+		file, err := g.build(ctx, pkg, g.dir, *platform, g.configForImportPath(ref.Path()))
+		if err != nil {
+			return nil, err
+		}
+
+		files[pkg] = file
+		defer os.RemoveAll(filepath.Dir(file))
+	}
+
+	var layers []mutate.Addendum
+
+	// TODO: multiple of these?
+	// Create a layer from the kodata directory under this import path.
+	dataLayerBuf, err := g.tarKoData(ref, platform)
+	if err != nil {
+		return nil, err
+	}
+	dataLayerBytes := dataLayerBuf.Bytes()
+	dataLayer, err := tarball.LayerFromOpener(func() (io.ReadCloser, error) {
+		return ioutil.NopCloser(bytes.NewBuffer(dataLayerBytes)), nil
+	}, tarball.WithCompressedCaching)
+	if err != nil {
+		return nil, err
+	}
+	layers = append(layers, mutate.Addendum{
+		Layer: dataLayer,
+		History: v1.History{
+			Author:    "ko",
+			CreatedBy: "ko publish " + ref.String(),
+			Comment:   "kodata contents, at $KO_DATA_PATH",
+		},
+	})
+
+	appPath := path.Join("/ko-app", appFilename(ref.Path()))
+
+	for path, file := range files {
+		// Construct a tarball with the binary and produce a layer.
+		binaryLayerBuf, err := tarBinary(path, file, v1.Time{}, platform)
+		if err != nil {
+			return nil, err
+		}
+		binaryLayerBytes := binaryLayerBuf.Bytes()
+		binaryLayer, err := tarball.LayerFromOpener(func() (io.ReadCloser, error) {
+			return ioutil.NopCloser(bytes.NewBuffer(binaryLayerBytes)), nil
+		}, tarball.WithCompressedCaching, tarball.WithEstargzOptions(estargz.WithPrioritizedFiles([]string{
+			// When using estargz, prioritize downloading the binary entrypoint.
+			appPath,
+		})))
+		if err != nil {
+			return nil, err
+		}
+		layers = append(layers, mutate.Addendum{
+			Layer: binaryLayer,
+			History: v1.History{
+				Author:    "ko",
+				CreatedBy: "ko publish " + ref.String(),
+				Comment:   "go build output, at " + appPath,
+			},
+		})
+	}
+
+	// Augment the base image with our application layer(s).
 	withApp, err := mutate.Append(base, layers...)
 	if err != nil {
 		return nil, err
