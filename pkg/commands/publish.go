@@ -16,6 +16,9 @@ package commands
 
 import (
 	"fmt"
+	"log"
+
+	"github.com/davecgh/go-spew/spew"
 
 	"github.com/google/ko/pkg/commands/options"
 	"github.com/spf13/cobra"
@@ -68,6 +71,8 @@ func addPublish(topLevel *cobra.Command) {
 				return fmt.Errorf("error creating publisher: %v", err)
 			}
 			defer publisher.Close()
+			log.Printf("PUBLISH")
+			spew.Dump(publisher, builder)
 			images, err := publishImages(ctx, args, publisher, builder)
 			if err != nil {
 				return fmt.Errorf("failed to publish images: %v", err)

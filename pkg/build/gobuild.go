@@ -31,6 +31,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"text/template"
@@ -974,6 +975,8 @@ func updatePath(cf *v1.ConfigFile, appPath string) {
 
 // Build implements build.Interface
 func (g *gobuild) Build(ctx context.Context, s string) (Result, error) {
+	debug.PrintStack()
+	log.Printf("Builds: %s", s)
 	// Determine the appropriate base image for this import path.
 	baseRef, base, err := g.getBase(ctx, s)
 	if err != nil {

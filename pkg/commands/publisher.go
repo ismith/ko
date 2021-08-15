@@ -41,6 +41,7 @@ func publishImages(ctx context.Context, importpaths []string, pub publish.Interf
 			return nil, fmt.Errorf("importpath %q is not supported: %v", importpath, err)
 		}
 
+		// TODO here
 		img, err := b.Build(ctx, importpath)
 		if err != nil {
 			return nil, fmt.Errorf("error building %q: %v", importpath, err)
